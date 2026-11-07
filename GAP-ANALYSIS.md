@@ -63,7 +63,7 @@ engine is from scratch.
 
 | Layer | Implemented | Dataset surface | Nominal coverage | Notes |
 |---|---|---:|---:|---|
-| CSS property names | 171 in `KNOWN` | 752 non-vendor | ~22% | dataset includes drafts; ~25-27% against names shipping in two mainstream engines |
+| CSS property names | 280 in `KNOWN` | 752 non-vendor | ~37% | dataset includes drafts; ~42% against names shipping in two mainstream engines |
 | CSS selectors | ~30 forms | 159 | ~20-25% | exact list in Â§4.2 |
 | CSS at-rules | 5 | 55 | ~9% | most missing ones are draft, print, speech, or animation-only |
 | HTML elements | 142 parse | 142 | behaviour partial | generic fallback parses all; 14 live elements lack behaviour |
@@ -159,11 +159,11 @@ engine has no bidi algorithm or `direction` handling.
 |---|---:|
 | Properties in `@webref/css` | 822 |
 | Non-vendor properties | 752 |
-| Names in the engine's `KNOWN` table | 171 |
+| Names in the engine's `KNOWN` table | 280 |
 | Additional accepted alias | `word-wrap` (same handler as `overflow-wrap`, also listed) |
-| Raw missing (non-vendor) | ~582 |
-| Coverage (non-vendor) | ~22% |
-| Coverage against names shipping in two mainstream engines | ~25-27% |
+| Raw missing (non-vendor) | ~472 |
+| Coverage (non-vendor) | ~37% |
+| Coverage against names shipping in two mainstream engines | ~42% |
 
 The `KNOWN` table is the source of truth for this count. A name in the table can
 still be only partially implemented; a name outside it can still work through a
@@ -664,6 +664,13 @@ backing store, which is a large RAM commitment. Do not add it for a checkbox.
    tests, and reftests. A curated subset (`css/selectors/`, `dom/nodes/`,
    `html/dom/`) is the only realistic first step. Screenshot diffing against the
    seven reference captures is more aligned with this project.
+   `tools/visual-diff.ps1` is that measurement: it renders a URL in this engine
+   and in a headless reference at the same 1000x616 viewport, crops the engine's
+   titlebar, masks the scrollbar and RSS meter, and reports the differing-pixel
+   percentage plus the worst 32x32 cells. It is a *gap finder*, not a pass/fail
+   gate: font rasterization, server-selected variants (theme, locale, A/B copy)
+   and preference cookies move the number without an engine bug, so a fresh
+   reference profile is mandatory and every report names its URL and settings.
 3. **Shipping-feature denominator.** Intersect the implemented surface with
    features that at least two mainstream engines ship, to exclude drafts.
 
@@ -679,50 +686,133 @@ backing store, which is a large RAM commitment. Do not add it for a checkbox.
   modes.
 - Every number in a report needs a command or a stated estimate.
 
+### 8.5 Visual parity baseline (wave 84)
+
+`tools/visual-diff.ps1 -Url <url> -Tag <tag>` at 1000x616, tolerance 32 per
+channel, 32x32 cells. First measurement:
+
+| Reference | Differing pixels | Notes |
+|---|---:|---|
+| nextjs.org | 7.97% | best match; font raster dominates |
+| rust-lang.org | 9.74% | section spacing and webfont metrics |
+| news.ycombinator.com | 16.06% | row heights and link text width |
+| developer.mozilla.org/en-US/ | 17.76% | promo banner and search control differ |
+| en.wikipedia.org/wiki/JavaScript | 23.26% | infobox was 643px wide; now 352px |
+| google.com | 98.4% | not comparable: server variant (theme + locale) differs |
+
+The first run found a real layout bug the property census could not see: a table
+with a declared `width` sized to its cells' max-content because the engine's
+min-content measurement used max-content for text and inline children. Chrome's
+Wikipedia infobox is ~317px (`width:22em` at the element's 90% font size); the
+engine used to lay it out at 643px and squeezed the article text into a narrow
+column. The fix brings the engine to 352px — the declared width resolved at the
+16px default because box lengths parse `em` at a fixed 16px instead of the
+element's own font size (a separate gap, still open).
+The remaining Wikipedia diff is dominated by glyph rasterization and a ~13px
+vertical offset of the article body, not by missing CSS names.
+
+A pixel number is a lower bound on visual parity only when the reference and the
+engine agree on the variant. Treat rows whose theme or language differs as "not
+measured", not as engine defects.
+
 ---
 
-## Appendix A - CSS property names accepted (171)
+## Appendix A - CSS property names accepted (280)
 
 ```text
-align-content, align-items, align-self, aspect-ratio
-backdrop-filter, background, background-clip, background-color, background-image, background-position, background-repeat
-background-size, border, border-bottom, border-bottom-color
-border-bottom-left-radius, border-bottom-right-radius, border-bottom-style
-border-bottom-width, border-collapse, border-color, border-left
-border-left-color, border-left-style, border-left-width, border-radius
-border-right, border-right-color, border-right-style, border-right-width
-border-spacing, border-style, border-top, border-top-color
-border-top-left-radius, border-top-right-radius, border-top-style
-border-top-width, border-width, bottom
-box-shadow, box-sizing, caption-side, clear, clip
-clip-path, color, color-scheme, column-gap
-content, cursor, display, fill
-fill-opacity, fill-rule, filter, flex, flex-basis
-flex-direction, flex-flow, flex-grow, flex-shrink
-flex-wrap, float, font, font-family, font-size
-font-style, font-weight, gap, grid-area, grid-auto-flow
-grid-column, grid-column-end, grid-column-start, grid-template-areas
-grid-template-columns, grid-template-rows, height, inset
-justify-content, justify-items, justify-self, left, letter-spacing, line-clamp
-line-height, list-style, list-style-position, list-style-type, margin
-margin-block, margin-block-end, margin-block-start, margin-bottom
-margin-inline, margin-inline-end, margin-inline-start, margin-left
-margin-right, margin-top, mask, mask-image
-mask-position, mask-repeat, mask-size, max-height
-max-width, min-height, min-width, object-fit
-object-position, opacity, order, outline
-outline-color, outline-offset, outline-style, outline-width
-overflow, overflow-wrap, overflow-x, overflow-y
-padding, padding-block, padding-block-end, padding-block-start
-padding-bottom, padding-inline, padding-inline-end, padding-inline-start
-padding-left, padding-right, padding-top, place-content, place-items, place-self
-position, right, row-gap, stroke, stroke-linecap
-stroke-linejoin, stroke-opacity, stroke-width, table-layout
-text-align, text-decoration, text-decoration-color, text-decoration-line
-text-decoration-style, text-decoration-thickness, text-indent, text-overflow
-text-shadow, text-transform, text-underline-offset, top, transform
-transform-origin, translate, rotate, scale, vertical-align, visibility
-white-space, width, word-break, word-spacing, word-wrap
+align-content, align-items, align-self
+animation, animation-delay, animation-direction
+animation-duration, animation-fill-mode, animation-iteration-count
+animation-name, animation-play-state, animation-timing-function
+appearance, aspect-ratio, backdrop-filter
+backface-visibility, background, background-clip
+background-color, background-image, background-position
+background-position-x, background-position-y, background-repeat
+background-size, border, border-block
+border-block-color, border-block-style, border-block-width
+border-bottom, border-bottom-color, border-bottom-left-radius
+border-bottom-right-radius, border-bottom-style, border-bottom-width
+border-collapse, border-color, border-inline
+border-inline-color, border-inline-style, border-inline-width
+border-left, border-left-color, border-left-style
+border-left-width, border-radius, border-right
+border-right-color, border-right-style, border-right-width
+border-spacing, border-style, border-top
+border-top-color, border-top-left-radius, border-top-right-radius
+border-top-style, border-top-width, border-width
+bottom, box-align, box-orient
+box-pack, box-shadow, box-sizing
+break-after, break-before, break-inside
+caption-side, clear, clip
+clip-path, color, color-scheme
+column-count, column-gap, column-width
+contain, content, counter-increment
+counter-reset, counter-set, cursor
+display, field-sizing, fill
+fill-opacity, fill-rule, filter
+flex, flex-basis, flex-direction
+flex-flow, flex-grow, flex-shrink
+flex-wrap, float, font
+font-display, font-family, font-feature-settings
+font-kerning, font-optical-sizing, font-size
+font-smoothing, font-style, font-synthesis
+font-variant, font-variant-alternates, font-variant-caps
+font-variant-east-asian, font-variant-ligatures, font-variant-numeric
+font-variant-position, font-variation-settings, font-weight
+forced-color-adjust, gap, grid-area
+grid-auto-flow, grid-column, grid-column-end
+grid-column-start, grid-template-areas, grid-template-columns
+grid-template-rows, height, hyphens
+inset, inset-block, inset-inline
+isolation, justify-content, justify-items
+justify-self, left, letter-spacing
+line-clamp, line-height, list-style
+list-style-image, list-style-position, list-style-type
+margin, margin-block, margin-block-end
+margin-block-start, margin-bottom, margin-inline
+margin-inline-end, margin-inline-start, margin-left
+margin-right, margin-top, mask
+mask-image, mask-position, mask-repeat
+mask-size, max-height, max-width
+min-height, min-width, mix-blend-mode
+object-fit, object-position, opacity
+order, osx-font-smoothing, outline
+outline-color, outline-offset, outline-style
+outline-width, overflow, overflow-scrolling
+overflow-style, overflow-wrap, overflow-x
+overflow-y, overscroll-behavior, overscroll-behavior-x
+overscroll-behavior-y, padding, padding-block
+padding-block-end, padding-block-start, padding-bottom
+padding-inline, padding-inline-end, padding-inline-start
+padding-left, padding-right, padding-top
+page-break-after, page-break-before, page-break-inside
+perspective, perspective-origin, place-content
+place-items, place-self, pointer-events
+position, quotes, resize
+right, rotate, row-gap
+scale, scrollbar-color, scrollbar-gutter
+scrollbar-width, scroll-behavior, scroll-chaining
+scroll-margin, scroll-margin-block, scroll-margin-bottom
+scroll-margin-inline, scroll-margin-left, scroll-margin-right
+scroll-margin-top, scroll-padding, scroll-padding-block
+scroll-padding-bottom, scroll-padding-inline, scroll-padding-left
+scroll-padding-right, scroll-padding-top, scroll-snap-align
+scroll-snap-type, shape-rendering, stroke
+stroke-linecap, stroke-linejoin, stroke-opacity
+stroke-width, table-layout, tab-size
+tap-highlight-color, text-align, text-decoration
+text-decoration-color, text-decoration-line, text-decoration-skip-ink
+text-decoration-style, text-decoration-thickness, text-fill-color
+text-indent, text-overflow, text-rendering
+text-shadow, text-size-adjust, text-transform
+text-underline-offset, text-wrap, top
+touch-action, touch-callout, transform
+transform-origin, transform-style, transition
+transition-delay, transition-duration, transition-property
+transition-timing-function, translate, user-drag
+user-select, vertical-align, visibility
+white-space, width, will-change
+word-break, word-spacing, word-wrap
 z-index
 ```
 
@@ -820,7 +910,7 @@ Invoke-WebRequest https://unpkg.com/@webref/elements@2.9.2/html.json -OutFile ht
 Invoke-WebRequest "https://unpkg.com/@webref/idl/?meta" -OutFile idl-meta.json
 (Get-Content idl-meta.json -Raw | ConvertFrom-Json).files.Count
 
-# Engine property table: 171 names
+# Engine property table: 280 names
 Select-String -Path src\css.rs -Pattern 'const KNOWN' -Context 0,130
 ```
 

@@ -3915,9 +3915,16 @@ fn content_min_w(n: &BoxNode, avail: f32, measure: &dyn Fn(&str, &Style) -> f32)
             if c.is_bg || c.is_mask || matches!(c.bx.pos, Pos::Absolute | Pos::Fixed) {
                 continue;
             }
-            let cw = if c.inline {
-                natural_w(c, avail, measure)
+            let cw = if c.is_text {
+                // text breaks at spaces: a line's min-content is its longest
+                // word, never the whole unwrapped string (natural_w). Using
+                // the max-content here inflated every block's min-content to
+                // its widest line — a table cell holding a caption could not
+                // shrink below the caption's unwrapped width.
+                content_min_w(c, avail, measure)
             } else {
+                // inline boxes break at their own spaces too (only replaced
+                // content, declared widths and images are atomic below)
                 min_content_w(c, avail, measure)
             };
             // a child's min-content contribution is its MARGIN box, exactly
@@ -14824,6 +14831,34 @@ line</textarea></div>"#,
     }
 
     // ---- table percentage widths / presentational attributes ----
+
+    #[test]
+    fn table_declared_width_wins_over_long_cell_min_content() {
+        // A declared `width` must bound the table even when a cell holds a
+        // long single line: min-content is the longest WORD, so the cell can
+        // wrap. Wikipedia's infobox (`width:22em`) sized to its caption's
+        // unwrapped max-content (643px) instead of 352px, pushing the whole
+        // article text into a narrow column.
+        let long = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi";
+        let mut root = boxes_of(
+            &format!(r#"<table class=t><tr><td>{long}</td></tr></table>"#),
+            ".t { width: 200px }",
+        );
+        layout_tree(&mut root, 800.0, &m4);
+        let t = &root.children[0];
+        // the declared 200px border box (border-spacing sits inside it)
+        assert_eq!(t.w, 200.0, "declared width bounds the table");
+        // auto width still shrink-wraps to the cell's max-content
+        let mut auto = boxes_of(
+            &format!(r#"<table><tr><td>{long}</td></tr></table>"#),
+            "",
+        );
+        layout_tree(&mut auto, 800.0, &m4);
+        assert!(
+            auto.children[0].w > 200.0,
+            "auto table still measures its cells' maximum content"
+        );
+    }
 
     #[test]
     fn table_width_attr_percent_matches_css() {
