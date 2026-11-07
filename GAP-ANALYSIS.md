@@ -175,7 +175,7 @@ handled, but the paint model still applies one radius to every corner.
 | Category | Missing | Examples | Decision relevance |
 |---|---:|---|---|
 | Other / miscellaneous | 217 | `bookmark-label`, `block-step-align`, `corner-*`, `cue` | ignore: drafts, print, speech |
-| Text & typography | 60 | `hyphens` | high: frequent in real CSS |
+| Text & typography | 60 | `text-emphasis`, `ruby-*` | high: frequent in real CSS; wave 83 accepts `hyphens`/`quotes`/`tab-size` as no-ops |
 | Logical properties & writing modes | 61 | `block-size`, `inline-size`, `margin-trim` | low frequency; wave 81 maps the horizontal-tb/ltr subset to physical |
 | Animation & transitions | 46 | `animation-*`, `transition-*` | medium only if motion is required; wave 82 accepts them as no-ops (one static frame) |
 | Borders & outlines | 18 | `border-image-*`, `border-block-*`, `border-inline-*` | medium: common in resets |
@@ -183,15 +183,15 @@ handled, but the paint model still applies one radius to every corner.
 | Paged & multi-column | 31 | `break-*`, `column-*` | wave 82 implements `column-width`/`column-count`/`column-gap` and accepts `break-*` |
 | Fonts | 22 | `font-variant-*`, `font-kerning`, `font-stretch` | medium; wave 82 accepts font-feature/font-variant selection as no-ops (fixed face) |
 | Grid & alignment | 9 | `grid-row`, `grid-auto-rows` | high |
-| Transforms & motion paths | 11 | `perspective`, `offset-*`, `transform-style` | medium |
+| Transforms & motion paths | 11 | `offset-*`, 3D `rotate` axes | medium; wave 83 accepts `perspective`, `perspective-origin`, `transform-style` (2D rasterizer) |
 | Overflow | 14 | `overflow-anchor`, `overflow-clip-margin-*` | low |
 | Backgrounds | 12 | `background-origin`, `background-attachment`, `background-blend-mode` | medium |
 | Masking & clipping | 13 | `mask-border-*`, `mask-mode`, `mask-composite` | low |
 | Containment, containers & anchors | 13 | `contain`, `container-*`, `anchor-*` | low |
 | Box, display & positioning | 11 | `appearance`, `all`, `float-offset` | medium |
 | Color & theming | 9 | `accent-color`, `caret-color`, `caret-shape` | low-medium |
-| Lists | 6 | `list-style-image`, `marker-*` | low |
-| Filters & compositing | 3 | `mix-blend-mode` | high for visual parity |
+| Lists | 6 | `marker-*` | low; wave 83 implements author counters and accepts `list-style-image` (glyph markers only) |
+| Filters & compositing | 3 | `background-blend-mode` | high for visual parity; `mix-blend-mode` is accepted but not rendered |
 | Tables | 0 | - | low |
 | Flexbox | 1 | `flex-line-count` | low |
 
@@ -313,6 +313,28 @@ relevant only when transitions and animations exist.
   are accepted no-ops (the engine paints one static frame), as are font
   feature selection (`font-feature-settings`, `font-variant-*`,
   `font-optical-sizing`, `font-synthesis`, …) and vendor scrolling hints.
+- Author counters (CSS Lists 3) implement `counter-reset`,
+  `counter-increment`, `counter-set`, and `counter(name[, style])` /
+  `counters(name, separator[, style])` inside `content`. A document-order
+  `CounterEnv` stack is threaded through layout's build walk: a reset pushes a
+  new instance, an increment/set mutates the innermost instance (creating it
+  at 0/value when missing), and instances unwind when the parent's child list
+  ends — the spec's "descendants and following siblings" scope. `::before`/
+  `::after` apply their own counter operations before resolving their content
+  (shortcut: `::after` resolves before the element's descendants are built, so
+  a descendant mutating the same counter is not seen by `::after`). Styles:
+  decimal, decimal-leading-zero, alpha/latin, roman and the glyph styles; a
+  custom `@counter-style` name falls back to decimal (the at-rule is accepted
+  and skipped). `@property`, `@starting-style` and `@font-feature-values` are
+  accepted as inert defining at-rules.
+- The inert batch also covers `hyphens`, `quotes`, `tab-size`,
+  `text-rendering`, `shape-rendering`, `field-sizing`, `isolation`,
+  `perspective`/`perspective-origin`, `transform-style`, `text-fill-color`,
+  `list-style-image` and `mix-blend-mode` — each needs a subsystem the engine
+  does not have (hyphenation dictionary, quote-keyword content, tab stops,
+  hinting, form intrinsic sizing, paint groups, 3D transforms, marker images),
+  so the declaration moves or sizes no box. `isolation`/`mix-blend-mode` are
+  accepted but no blend group is rendered.
 - Borders: per-side width and colour longhands parse into the existing model,
   which still keeps one colour for all sides and one radius for all corners
   (the last declaration wins); a `transparent` colour keeps the side's width
@@ -509,7 +531,7 @@ The global count hides missing prototype methods. Verified absent examples:
 | Process model | one process, no sandbox |
 | DevTools | element inspector only; no console or network debugger |
 | Extensions | none |
-| Conformance tests | none - 885 self-authored unit tests (889 with `engine-b + woff2`), zero conformance-suite runs |
+| Conformance tests | none - 890 self-authored unit tests (894 with `engine-b + woff2`), zero conformance-suite runs |
 
 ---
 
@@ -596,7 +618,23 @@ animation/font-feature/vendor properties, dropping IE hack names
 `@keyframes`)
 cut the census to Wikipedia 21 -> 10, rust 4 -> 0, Hacker News 3 -> 0,
 google 16 -> 3, nextjs 43 -> 20 and MDN 4 -> 1 distinct dropped properties.
-What remains:
+Wave 83 then implemented author counters (`counter-reset`,
+`counter-increment`, `counter-set`, and `counter()`/`counters()` inside
+`content`) with a document-order `CounterEnv` whose instances unwind at the end
+of the parent's child list — the spec's descendants-and-following-siblings
+scope. It also accepts `@property`, `@counter-style`, `@starting-style` and
+`@font-feature-values` as inert defining at-rules, plus a curated inert batch
+(`hyphens`, `quotes`, `tab-size`, `text-rendering`, `shape-rendering`,
+`field-sizing`, `isolation`, `perspective`, `transform-style`,
+`text-fill-color`, `list-style-image`, `mix-blend-mode`). The census falls to
+Wikipedia 10 -> 2 (`unicode-bidi`, `direction`), rust 0, Hacker News 0, google
+3 + `@container`, nextjs 20 -> 7 + `@container` and MDN 1, with no at-rule
+misses outside `@container`; heights are unchanged on all six sites. Because
+`@supports` tests property presence, accepting `hyphens` flips a vendor-prefixed
+`hyphens: none` feature query to true (matching a real engine) and moves
+Wikipedia's subreference markers to the `::before` form (+41 runs).
+On the CSS side what remains is bidi (`direction`/`unicode-bidi`), grid
+row/auto placement, the `all` shorthand and `@container`. On the JS side:
 `Reflect`
 metadata methods, ES2024 Set methods, Map `emplace`/`upsert`,
 `Object.isExtensible`/`getOwnPropertySymbols`, `reportError`, `innerHTML`

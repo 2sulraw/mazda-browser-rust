@@ -5,8 +5,8 @@
 
 use crate::css::{
     content_text, decl, marker_text, Align, BgClip, BgPos, BgRepeat, BgSize, BoxStyle, CaptionSide,
-    Clear, Cursor, Dir, Display, Filter, Float, Gradient, GridFlow, Justify, Len, ObjFit, Pos, PseudoEl,
-    Sheet, TableRole, Track, TrackBreadth, VAlign, VarScope,
+    Clear, CounterEnv, Cursor, Dir, Display, Filter, Float, Gradient, GridFlow, Justify, Len, ObjFit,
+    Pos, PseudoEl, Sheet, TableRole, Track, TrackBreadth, VAlign, VarScope,
 };
 use crate::html::{Dom, NodeKind};
 use crate::image::ImageData;
@@ -840,15 +840,47 @@ pub fn build_scoped(
         let ph = mask_placeholder(&u, style, &root.bx);
         root.children.push(ph);
     }
+    // author counters: the root element's own operations seed the document
+    // environment (never truncated — the root is the outermost scope)
+    let mut counters = CounterEnv::default();
+    counters.apply(&root.bx);
     // the body's own ::before/::after (the root IS the body's box):
     // ::before paints over the background placeholder (pushed after it)
     // and under the content; ::after closes the box. `bx.cursor` is the
     // body's effective cursor — build threads it down from here.
-    if let Some(b) = pseudo_box(sheet, dom, node, style, None, seed, PseudoEl::Before) {
+    if let Some(b) = pseudo_box(
+        sheet,
+        dom,
+        node,
+        style,
+        None,
+        seed,
+        PseudoEl::Before,
+        &mut counters,
+    ) {
         root.children.push(b);
     }
-    build_into(dom, node, style, sheet, None, seed, vars, &mut root.children);
-    if let Some(a) = pseudo_box(sheet, dom, node, style, None, seed, PseudoEl::After) {
+    build_into(
+        dom,
+        node,
+        style,
+        sheet,
+        None,
+        seed,
+        vars,
+        &mut counters,
+        &mut root.children,
+    );
+    if let Some(a) = pseudo_box(
+        sheet,
+        dom,
+        node,
+        style,
+        None,
+        seed,
+        PseudoEl::After,
+        &mut counters,
+    ) {
         root.children.push(a);
     }
     apply_effects(&mut root, 1.0, None);
@@ -1029,11 +1061,11 @@ fn paints_chrome(bx: &BoxStyle) -> bool {
 /// surrounding text, or an inline box carrying the pseudo's own style when
 /// it paints chrome (background/border/padding) or declares a box-level
 /// `display` — the same box decision an element with that style gets.
-/// shortcut: generated content is plain text — non-list counters render as
-/// nothing (list-item markers are a separate synthesized run, see
-/// `list_marker`), and a `::before` on a replaced element (`<img>`/`<svg>`)
-/// or form control generates no box at all (those branches return before
-/// this is consulted).
+/// shortcut: generated content is plain text — quote keywords contribute
+/// nothing and a `::before` on a replaced element (`<img>`/`<svg>`) or form
+/// control generates no box at all (those branches return before this is
+/// consulted).
+#[allow(clippy::too_many_arguments)]
 fn pseudo_box(
     sheet: &Sheet,
     dom: &Dom,
@@ -1042,8 +1074,13 @@ fn pseudo_box(
     link: Option<std::rc::Rc<str>>,
     cursor: Option<Cursor>,
     kind: PseudoEl,
+    counters: &mut CounterEnv,
 ) -> Option<BoxNode> {
     let out = sheet.resolve_pseudo(dom, node, base, kind)?;
+    // the pseudo-element's own counter operations happen before its content
+    // resolves (and before display:none suppresses the box — counters are
+    // document-order state, not painted content)
+    counters.apply(&out.bx);
     if out.display_none {
         return None;
     }
@@ -1052,7 +1089,7 @@ fn pseudo_box(
     let cur = out.bx.cursor.or(cursor);
     let raw = out.bx.content.as_deref()?; // content undeclared → no box
     // `None` item: ::before/::after have no list-item counter
-    let text = content_text(raw, dom, node, None)?; // none/normal/malformed → no box
+    let text = content_text(raw, dom, node, None, counters)?; // none/normal/malformed → no box
     // generated content transforms like any other built text box
     let text = transform_text(&text, out.style.text_transform).into_owned();
     let chrome = paints_chrome(&out.bx);
@@ -1103,12 +1140,14 @@ fn list_marker(
     base: Style,
     link: Option<std::rc::Rc<str>>,
     cursor: Option<Cursor>,
+    counters: &CounterEnv,
 ) -> Option<BoxNode> {
     let mut text = marker_text(base.list_type, ordinal)?;
     let mut style = base;
     if let Some(m) = sheet.resolve_pseudo(dom, node, base, PseudoEl::Marker) {
         if let Some(raw) = m.bx.content.as_deref() {
-            if let Some(t) = content_text(raw, dom, node, Some((ordinal, base.list_type))) {
+            if let Some(t) = content_text(raw, dom, node, Some((ordinal, base.list_type)), counters)
+            {
                 if !t.is_empty() {
                     text = t;
                 }
@@ -1161,8 +1200,13 @@ fn build_into(
     // custom properties in effect for this subtree (the parent's chain) —
     // `var()` in child declarations resolves through it
     vars: Option<&std::rc::Rc<VarScope>>,
+    // author counters in document order (see `CounterEnv`): this call's
+    // children may create instances that stay in scope for their FOLLOWING
+    // siblings, so the stack is only unwound when this child list ends
+    counters: &mut CounterEnv,
     out: &mut Vec<BoxNode>,
 ) {
+    let counter_mark = counters.mark();
     // Per-list item numbering: `node` is the PARENT whose children are being
     // built, so each `<ol>`/`<ul>` gets its own counter (nested lists restart
     // independently). `<ol start=N>` seeds it; `<li value=N>` resets it for
@@ -1219,6 +1263,10 @@ fn build_into(
                 // relative font-sizes compute against the TRUE parent (style),
                 // not the UA-bumped child_style (headings would compound 2x)
                 let outcome = sheet.resolve_scoped(dom, child, child_style, dom.attr(child, "style"), style.size, vars);
+                // the element's own counter operations happen before its
+                // ::before and its content; they stay in scope for its
+                // following siblings (unwound at the end of this child list)
+                counters.apply(&outcome.bx);
                 if outcome.display_none {
                     continue;
                 }
@@ -1240,6 +1288,12 @@ fn build_into(
                 // branches below. Replaced elements (<img>/<svg>) and the
                 // leaf controls (<input>/<select>/<textarea>) ignore these
                 // (see pseudo_box); <button> is a container and keeps them.
+                // shortcut: both pseudo boxes resolve their counters here,
+                // before this element's children are built (the ::after box
+                // is still APPENDED last). A descendant that mutates the same
+                // counter would therefore not be seen by ::after's content;
+                // real pages put counter increments on ::before or on the
+                // element itself, which this order handles correctly.
                 let before = pseudo_box(
                     sheet,
                     dom,
@@ -1248,6 +1302,7 @@ fn build_into(
                     child_link.clone(),
                     cur,
                     PseudoEl::Before,
+                    counters,
                 );
                 let after = pseudo_box(
                     sheet,
@@ -1257,6 +1312,7 @@ fn build_into(
                     child_link.clone(),
                     cur,
                     PseudoEl::After,
+                    counters,
                 );
                 if tag == "img" {
                     // replaced element: box now, pixels when main fetches the src.
@@ -1415,7 +1471,7 @@ fn build_into(
                     if let Some(b) = before {
                         g.children.push(b);
                     }
-                    build_into(dom, child, outcome.style, sheet, child_link.clone(), cur, outcome.vars.as_ref(), &mut g.children);
+                    build_into(dom, child, outcome.style, sheet, child_link.clone(), cur, outcome.vars.as_ref(), counters, &mut g.children);
                     if let Some(a) = after {
                         g.children.push(a);
                     }
@@ -1562,7 +1618,7 @@ fn build_into(
                 // boxes generate none) and margins/padding/borders are
                 // ignored. shortcut: on the root/body it still makes a box.
                 if outcome.bx.display == Display::Contents {
-                    build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), out);
+                    build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), counters, out);
                     continue;
                 }
                 // which elements get a box: flex/grid/block/inline-block
@@ -1657,7 +1713,14 @@ fn build_into(
                     // marker.
                     if tag == "li" {
                         if let Some(m) = list_marker(
-                            sheet, dom, child, ordinal, outcome.style, child_link.clone(), cur,
+                            sheet,
+                            dom,
+                            child,
+                            ordinal,
+                            outcome.style,
+                            child_link.clone(),
+                            cur,
+                            counters,
                         ) {
                             g.children.push(m);
                         }
@@ -1669,7 +1732,7 @@ fn build_into(
                     // border paint) placed ON the surrounding text line by
                     // block()'s inline branch instead of stacking
                     g.inline = inline_level(&g.bx);
-                    build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), &mut g.children);
+                    build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), counters, &mut g.children);
                     if let Some(a) = after {
                         g.children.push(a);
                     }
@@ -1699,7 +1762,7 @@ fn build_into(
                         if let Some(b) = before {
                             g.children.push(b);
                         }
-                        build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), &mut g.children);
+                        build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), counters, &mut g.children);
                         if let Some(a) = after {
                             g.children.push(a);
                         }
@@ -1726,7 +1789,7 @@ fn build_into(
                             if let Some(b) = before {
                                 g.children.push(b);
                             }
-                            build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), &mut g.children);
+                            build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), counters, &mut g.children);
                             if let Some(a) = after {
                                 g.children.push(a);
                             }
@@ -1735,7 +1798,7 @@ fn build_into(
                             if let Some(b) = before {
                                 out.push(b);
                             }
-                            build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), out);
+                            build_into(dom, child, outcome.style, sheet, child_link, cur, outcome.vars.as_ref(), counters, out);
                             if let Some(a) = after {
                                 out.push(a);
                             }
@@ -1745,6 +1808,8 @@ fn build_into(
             }
         }
     }
+    // the child list is done: counters its children created go out of scope
+    counters.truncate(counter_mark);
 }
 
 /// One painted `box-shadow` — resolved to px at layout. `color` already
@@ -14160,6 +14225,54 @@ line</textarea></div>"#,
         // the element's own cascade is untouched by the pseudo rules
         assert_eq!(div.style.color, 0x111111);
         assert!(div.children[1].is_text && div.children[1].text == "hi");
+    }
+
+    #[test]
+    fn author_counters_follow_document_order_and_scope() {
+        // `counter-reset` creates an instance in scope for the element's
+        // descendants and FOLLOWING SIBLINGS; a nested reset shadows the
+        // outer instance until the subtree that created it ends.
+        let css = r#"
+            .list { counter-reset: n 0 }
+            .sub { counter-reset: n 10 }
+            .item { counter-increment: n }
+            .item::before { content: counter(n) ' ' }
+        "#;
+        let mut root = boxes_of(
+            r#"<div class="list">
+                 <p class="item">a</p>
+                 <div class="wrap"><div class="sub"><p class="item">b</p></div></div>
+                 <p class="item">c</p>
+               </div>"#,
+            css,
+        );
+        let l = layout_tree(&mut root, 800.0, &m4);
+        let joined: String = l.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(
+            joined, "1a11b2c",
+            "outer 1, nested reset 10+1, then the outer instance again"
+        );
+
+        // a counter-increment on a PSEUDO-element happens before its own
+        // content resolves: reset -1, each ::before increments, so the two
+        // backlinks read 0 and 1 (the reset value is the starting point)
+        let mut root = boxes_of(
+            r#"<p class="links"><a>x</a><a>y</a></p>"#,
+            r#".links { counter-reset: n -1 }
+               .links a::before { counter-increment: n; content: counter(n) }"#,
+        );
+        let l = layout_tree(&mut root, 800.0, &m4);
+        let joined: String = l.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(joined, "0x1y");
+
+        // increment with no reset in scope behaves as reset-to-0 + delta
+        let mut root = boxes_of(
+            r#"<p class="item">z</p>"#,
+            r#".item { counter-increment: n 3 } .item::before { content: counter(n) }"#,
+        );
+        let l = layout_tree(&mut root, 800.0, &m4);
+        let joined: String = l.runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(joined, "3z");
     }
 
     #[test]

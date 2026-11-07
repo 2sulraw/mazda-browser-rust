@@ -1085,6 +1085,18 @@ pub struct BoxStyle {
     /// cascade time). None = not declared. Real elements ignore it — the
     /// property only feeds pseudo-element boxes.
     pub content: Option<String>,
+    /// `counter-reset`: counter INSTANCES created on this element (name,
+    /// initial value). Applied in document order by layout's build walk; an
+    /// instance is in scope for the element's descendants and its following
+    /// siblings (see [`CounterEnv`]). Empty = no declaration.
+    pub counter_reset: Vec<(String, i64)>,
+    /// `counter-increment`: (name, delta) added to the innermost instance in
+    /// scope. A name with no instance in scope is created at 0 first, so the
+    /// increment itself seeds it (CSS 2.1's implicit reset).
+    pub counter_inc: Vec<(String, i64)>,
+    /// `counter-set`: (name, value) assigned to the innermost instance in
+    /// scope; a missing instance is created with that value.
+    pub counter_set: Vec<(String, i64)>,
 }
 
 /// Bits for [`BoxStyle::declared`]: one per property UA control chrome fills.
@@ -1240,6 +1252,9 @@ impl Default for BoxStyle {
             appearance_none: false,
             declared: 0,
             content: None,
+            counter_reset: Vec::new(),
+            counter_inc: Vec::new(),
+            counter_set: Vec::new(),
         }
     }
 }
@@ -1805,6 +1820,11 @@ const KNOWN: &[&str] = &[
     "text-underline-offset",
     "display",
     "content",
+    // CSS Lists author counters: parsed onto `BoxStyle` and resolved in
+    // document order by layout's build walk (see `CounterEnv`).
+    "counter-reset",
+    "counter-increment",
+    "counter-set",
     "opacity",
     "filter",
     "backdrop-filter",
@@ -2059,6 +2079,29 @@ const KNOWN: &[&str] = &[
     "scroll-margin-left",
     "scroll-margin-block",
     "scroll-margin-inline",
+    // inert properties: each one needs a subsystem this engine does not have
+    // (a hyphenation dictionary, a quote-keyword content engine, tab-stop
+    // measurement, hinting/shape controls, form intrinsic sizing, a paint
+    // group for isolation/blending, a 3D transform pipeline, or marker
+    // images), so none of them moves or sizes a box. The two paint-affecting
+    // ones (`isolation`, `mix-blend-mode`) are accepted but no blend group is
+    // rendered — the documented static-frame limitation. `quotes` is
+    // consistent with `content`'s open-quote/close-quote contributing
+    // nothing; `list-style-image` only ever appears as `none` on the
+    // reference set and glyph markers are what we paint.
+    "hyphens",
+    "quotes",
+    "tab-size",
+    "text-rendering",
+    "shape-rendering",
+    "field-sizing",
+    "isolation",
+    "perspective",
+    "perspective-origin",
+    "transform-style",
+    "text-fill-color",
+    "list-style-image",
+    "mix-blend-mode",
 ];
 
 /// Observed CSS misses (`MAZDA_MISS=1`, dev-only): property names dropped by
@@ -2356,7 +2399,24 @@ fn handle_at_rule(s: &str, b: &[u8], at: usize, vw: f32) -> usize {
     // skipped on purpose by documented shortcuts)
     if !matches!(
         name,
-        "media" | "supports" | "layer" | "import" | "font-face" | "keyframes"
+        "media"
+            | "supports"
+            | "layer"
+            | "import"
+            | "font-face"
+            | "keyframes"
+            // typed custom-property registration: every custom property is
+            // already an untyped token here, so the registration is inert
+            | "property"
+            // custom counter-style definitions: accepted, but named styles
+            // fall back to decimal (see `counter_text`)
+            | "counter-style"
+            // transition start states: the engine paints one static frame
+            | "starting-style"
+            // named font-feature value sets: font-variant-* and
+            // font-feature-settings are accepted no-ops (one fixed face), so
+            // the definitions select nothing
+            | "font-feature-values"
     ) {
         note_unknown_at_rule(name);
     }
@@ -3160,12 +3220,13 @@ pub fn parse_decls(block: &str) -> Vec<Decl> {
         // a url() keeps its raw case (same reason the @font-face scanner
         // bypasses this function); `content` strings are case-sensitive
         // text the page authored (`content: "OK"` must not become "ok").
+        // Counter names are case-sensitive custom idents too.
         // ascii lowercasing is 1:1 on bytes, so positions found in the
         // lowered copy index the raw one too
         let raw = v.trim();
         let lower = raw.to_ascii_lowercase();
         let imp = lower.find("!important");
-        let mut v = if lower.contains("url(") || p == "content" {
+        let mut v = if lower.contains("url(") || p == "content" || p.starts_with("counter-") {
             raw.to_string()
         } else {
             lower
@@ -4459,6 +4520,13 @@ fn apply_decl(
         // the DOM). Real elements ignore it; only `Sheet::resolve_pseudo`
         // outcomes ever reach a box.
         "content" => bx.content = Some(d.1.clone()),
+        // author counters (CSS Lists 3): stored as (name, integer) lists and
+        // applied in document order by layout's build walk. A counter name is
+        // a case-sensitive custom ident, which is why `parse_decls` keeps the
+        // raw value for `counter-*` (like `content`).
+        "counter-reset" => bx.counter_reset = parse_counter_list(&d.1, 0),
+        "counter-increment" => bx.counter_inc = parse_counter_list(&d.1, 1),
+        "counter-set" => bx.counter_set = parse_counter_list(&d.1, 0),
         // stacking level of a POSITIONED box (layout.rs `collect_paint`
         // ignores it on static boxes, spec). `auto` and garbage → None =
         // paint in tree order (the pre-z-index behavior)
@@ -4562,6 +4630,35 @@ fn apply_decl(
     false
 }
 
+/// `counter-reset` / `counter-increment` / `counter-set` value → `(name,
+/// value)` pairs. Tokens alternate: a counter name (custom ident) followed by
+/// an OPTIONAL integer; a missing integer takes `default` (0 for reset/set,
+/// 1 for increment). `none` clears the property. Junk is skipped rather than
+/// failing the whole declaration, matching the cascade's tolerant parsing.
+fn parse_counter_list(v: &str, default: i64) -> Vec<(String, i64)> {
+    let mut out = Vec::new();
+    let toks: Vec<&str> = v.split_ascii_whitespace().collect();
+    let mut i = 0usize;
+    while i < toks.len() {
+        let name = toks[i];
+        if name.eq_ignore_ascii_case("none") || name.parse::<i64>().is_ok() {
+            i += 1;
+            continue;
+        }
+        match toks.get(i + 1).and_then(|t| t.parse::<i64>().ok()) {
+            Some(n) => {
+                out.push((name.to_string(), n));
+                i += 2;
+            }
+            None => {
+                out.push((name.to_string(), default));
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 /// `list-style-type` keyword → [`ListStyleType`]; `None` = unknown keyword
 /// (the declaration is dropped and the inherited type survives).
 fn parse_list_type(v: &str) -> Option<ListStyleType> {
@@ -4651,16 +4748,165 @@ fn roman_num(n: i64) -> String {
     out
 }
 
+/// Document-order CSS counter state (CSS Lists 3). One entry per counter
+/// INSTANCE, outermost first: `counter-reset` pushes a new instance (a reset
+/// always starts a nested counter even when one of that name is already in
+/// scope), while `counter-increment`/`counter-set` mutate the innermost
+/// instance of that name. Scope is handled by layout's build walk: an
+/// element's operations are applied when the element is entered, and every
+/// entry they pushed is dropped when its PARENT finishes its child list —
+/// which is exactly "in scope for the element's descendants and following
+/// siblings". Mutations of an ancestor's instance survive, as they should.
+#[derive(Default)]
+pub struct CounterEnv {
+    stack: Vec<(String, i64)>,
+}
+
+impl CounterEnv {
+    /// Stack height to restore when a child list ends (see `truncate`).
+    pub fn mark(&self) -> usize {
+        self.stack.len()
+    }
+
+    /// Drop the instances created inside the finished child list.
+    pub fn truncate(&mut self, mark: usize) {
+        self.stack.truncate(mark);
+    }
+
+    /// Apply an element's (or pseudo-element's) counter properties in spec
+    /// order: reset (new instances), then increment, then set.
+    pub fn apply(&mut self, bx: &BoxStyle) {
+        for (name, v) in &bx.counter_reset {
+            self.stack.push((name.clone(), *v));
+        }
+        for (name, v) in &bx.counter_inc {
+            match self.stack.iter_mut().rev().find(|(n, _)| n == name) {
+                Some((_, cur)) => *cur += *v,
+                // no instance in scope: CSS 2.1 says behave as if the
+                // element reset it to 0, then increment
+                None => self.stack.push((name.clone(), *v)),
+            }
+        }
+        for (name, v) in &bx.counter_set {
+            match self.stack.iter_mut().rev().find(|(n, _)| n == name) {
+                Some((_, cur)) => *cur = *v,
+                None => self.stack.push((name.clone(), *v)),
+            }
+        }
+    }
+
+    /// Innermost value of `name` (0 when the counter is not in scope).
+    pub fn value(&self, name: &str) -> i64 {
+        self.stack
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map_or(0, |(_, v)| *v)
+    }
+
+    /// Every instance of `name`, outermost first — the `counters()` order.
+    pub fn values(&self, name: &str) -> Vec<i64> {
+        self.stack
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, v)| *v)
+            .collect()
+    }
+}
+
+/// Format a counter value in a `counter()`/`counters()` style. `decimal` is
+/// the initial style; alpha/roman use the same formatters as list markers.
+/// shortcut: a custom `@counter-style` name falls back to decimal (we accept
+/// the at-rule but do not register its symbols), and `none` prints nothing.
+fn counter_text(n: i64, style: &str) -> String {
+    match style.trim().to_ascii_lowercase().as_str() {
+        "decimal-leading-zero" => format!("{n:02}"),
+        "lower-alpha" | "lower-latin" => alpha_num(n).to_ascii_lowercase(),
+        "upper-alpha" | "upper-latin" => alpha_num(n).to_ascii_uppercase(),
+        "lower-roman" => roman_num(n).to_ascii_lowercase(),
+        "upper-roman" => roman_num(n),
+        "disc" => "\u{2022}".into(),
+        "circle" => "\u{25e6}".into(),
+        "square" => "\u{25aa}".into(),
+        "none" => String::new(),
+        // `decimal`, an empty style, a custom ident and junk
+        _ => n.to_string(),
+    }
+}
+
+/// Split a `counter()`/`counters()` argument list on top-level commas,
+/// keeping quoted strings (a separator may contain a comma) intact.
+fn split_counter_args(s: &str) -> Vec<String> {
+    let b: Vec<char> = s.chars().collect();
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut i = 0usize;
+    let mut quote: Option<char> = None;
+    while i < b.len() {
+        let c = b[i];
+        match quote {
+            Some(q) => {
+                cur.push(c);
+                if c == '\\' && i + 1 < b.len() {
+                    cur.push(b[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    cur.push(c);
+                }
+                ',' => {
+                    out.push(cur.trim().to_string());
+                    cur.clear();
+                }
+                _ => cur.push(c),
+            },
+        }
+        i += 1;
+    }
+    out.push(cur.trim().to_string());
+    out
+}
+
+/// Strip the quotes from a `counters()` separator argument (backslash escapes
+/// resolve to the literal next character, like `content_text`'s strings).
+fn unquote_counter_arg(s: &str) -> String {
+    let b: Vec<char> = s.trim().chars().collect();
+    if b.len() >= 2 && (b[0] == '\'' || b[0] == '"') && b[b.len() - 1] == b[0] {
+        let mut out = String::new();
+        let mut i = 1usize;
+        while i + 1 < b.len() {
+            if b[i] == '\\' && i + 2 < b.len() {
+                out.push(b[i + 1]);
+                i += 2;
+            } else {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+        out
+    } else {
+        s.trim().to_string()
+    }
+}
+
 /// Resolve a declared `content` value to the text a pseudo-element box
 /// generates — `None` = no box (`none`/`normal`/empty/malformed value).
-/// Tokens concatenate: quoted strings (case preserved, `\` escapes honored)
-/// and `attr(name)` against the origin element (a missing attribute
-/// contributes nothing — the box, if any, carries empty text).
+/// Tokens concatenate: quoted strings (case preserved, `\` escapes honored),
+/// `attr(name)` against the origin element (a missing attribute contributes
+/// nothing — the box, if any, carries empty text), and author counters
+/// resolved through `counters` (see [`CounterEnv`]): `counter(name[, style])`
+/// prints the innermost value and `counters(name, sep[, style])` joins every
+/// instance outermost-first.
 /// `item` = the list-item counter for this box when the value comes from a
 /// `::marker` rule: `counter(list-item)` then renders the same marker text
 /// the UA would have generated (ordered styles include their trailing `.`).
-/// All other counters (`counter(x)`, `counters(...)`) contribute nothing —
-/// the engine has no counter scopes beyond the per-list item number.
 /// shortcut: quote keywords (`open-quote` …), `url()`, and `attr()` with a
 /// type/fallback argument contribute nothing. `::placeholder`/`::backdrop`
 /// don't parse as selectors at all.
@@ -4669,6 +4915,7 @@ pub fn content_text(
     dom: &Dom,
     node: u32,
     item: Option<(i64, ListStyleType)>,
+    counters: &CounterEnv,
 ) -> Option<String> {
     let s = raw.trim();
     if s.is_empty() || s.eq_ignore_ascii_case("none") || s.eq_ignore_ascii_case("normal") {
@@ -4744,15 +4991,34 @@ pub fn content_text(
                         }
                     }
                 } else if name.eq_ignore_ascii_case("counter") {
-                    // `counter(list-item[, style])` only; the optional style
-                    // argument is ignored (the list item's own type wins)
-                    let a = args.as_deref().unwrap_or("").trim();
-                    let a = a.split(',').next().unwrap_or("").trim();
-                    if a.eq_ignore_ascii_case("list-item") {
+                    // `counter(name[, style])`
+                    let parts = split_counter_args(args.as_deref().unwrap_or(""));
+                    let cname = parts.first().map(|s| s.trim()).unwrap_or("");
+                    let style = parts.get(1).map(|s| s.trim()).unwrap_or("");
+                    if cname.eq_ignore_ascii_case("list-item") {
                         if let Some((n, ty)) = item {
                             if let Some(t) = marker_text(ty, n) {
                                 out.push_str(&t);
                             }
+                        } else {
+                            out.push_str(&counter_text(counters.value(cname), style));
+                        }
+                    } else if !cname.is_empty() {
+                        out.push_str(&counter_text(counters.value(cname), style));
+                    }
+                } else if name.eq_ignore_ascii_case("counters") {
+                    // `counters(name, separator[, style])` — every instance
+                    // outermost-first, joined by the (quoted) separator
+                    let parts = split_counter_args(args.as_deref().unwrap_or(""));
+                    let cname = parts.first().map(|s| s.trim()).unwrap_or("");
+                    let sep = parts.get(1).map(|s| unquote_counter_arg(s)).unwrap_or_default();
+                    let style = parts.get(2).map(|s| s.trim()).unwrap_or("");
+                    if !cname.is_empty() {
+                        for (k, v) in counters.values(cname).iter().enumerate() {
+                            if k > 0 {
+                                out.push_str(&sep);
+                            }
+                            out.push_str(&counter_text(*v, style));
                         }
                     }
                 }
@@ -9501,6 +9767,7 @@ mod tests {
     fn content_text_strings_attr_and_none() {
         let dom = dom_of("<p data-x=\"Hi\">x</p>");
         let p = by_tag(&dom, "p");
+        let ce = CounterEnv::default();
         // quoted strings keep their case (parse_decls skips lowercasing)
         let sheet = parse("p::before { content: \"MiXeD\" }");
         let raw = sheet
@@ -9509,36 +9776,206 @@ mod tests {
             .bx
             .content
             .unwrap();
-        assert_eq!(content_text(&raw, &dom, p, None), Some("MiXeD".to_string()));
+        assert_eq!(
+            content_text(&raw, &dom, p, None, &ce),
+            Some("MiXeD".to_string())
+        );
         // multiple tokens concatenate: string + attr() + string
         assert_eq!(
-            content_text("\"a\" attr(data-x) \" —\"", &dom, p, None),
+            content_text("\"a\" attr(data-x) \" —\"", &dom, p, None, &ce),
             Some("aHi —".to_string())
         );
         // a missing attribute contributes nothing (empty text, no crash)
         let bare = dom_of("<p>x</p>");
         let p2 = by_tag(&bare, "p");
-        assert_eq!(content_text("attr(data-x)", &bare, p2, None), Some(String::new()));
+        assert_eq!(
+            content_text("attr(data-x)", &bare, p2, None, &ce),
+            Some(String::new())
+        );
         // `none`/`normal` and non-list counters generate no text — no box
-        assert_eq!(content_text("none", &dom, p, None), None);
-        assert_eq!(content_text("NONE", &dom, p, None), None, "case-insensitive keyword");
-        assert_eq!(content_text("normal", &dom, p, None), None);
-        assert_eq!(content_text("counter(item)", &dom, p, None), Some(String::new()));
+        assert_eq!(content_text("none", &dom, p, None, &ce), None);
+        assert_eq!(
+            content_text("NONE", &dom, p, None, &ce),
+            None,
+            "case-insensitive keyword"
+        );
+        assert_eq!(content_text("normal", &dom, p, None, &ce), None);
+        // a counter that is not in scope reads 0 (CSS Lists: the initial
+        // value), so the token contributes "0" rather than nothing
+        assert_eq!(
+            content_text("counter(item)", &dom, p, None, &ce),
+            Some("0".to_string())
+        );
         // `content: none` is recorded as declared (the flag) but boxes nothing
         let sheet2 = parse("p::after { content: none }");
         let after = sheet2
             .resolve_pseudo(&dom, p, Style::new(), PseudoEl::After)
             .unwrap();
         assert_eq!(after.bx.content.as_deref(), Some("none"));
-        assert_eq!(content_text(after.bx.content.as_deref().unwrap(), &dom, p, None), None);
+        assert_eq!(
+            content_text(after.bx.content.as_deref().unwrap(), &dom, p, None, &ce),
+            None
+        );
         // counter(list-item) resolves to the generated marker text when the
         // caller supplies the item counter (::marker path)
         assert_eq!(
-            content_text("counter(list-item)", &dom, p, Some((3, ListStyleType::Decimal))),
+            content_text(
+                "counter(list-item)",
+                &dom,
+                p,
+                Some((3, ListStyleType::Decimal)),
+                &ce
+            ),
             Some("3.".to_string())
         );
         // escapes inside strings
-        assert_eq!(content_text(r#""a\"b""#, &dom, p, None), Some("a\"b".to_string()));
+        assert_eq!(
+            content_text(r#""a\"b""#, &dom, p, None, &ce),
+            Some("a\"b".to_string())
+        );
+    }
+
+    #[test]
+    fn counter_env_scopes_increments_and_sets() {
+        let mut ce = CounterEnv::default();
+        // outer list: reset to 0, two items
+        ce.apply(&BoxStyle {
+            counter_reset: vec![("n".into(), 0)],
+            ..Default::default()
+        });
+        assert_eq!(ce.value("n"), 0);
+        for _ in 0..2 {
+            ce.apply(&BoxStyle {
+                counter_inc: vec![("n".into(), 1)],
+                ..Default::default()
+            });
+        }
+        assert_eq!(ce.value("n"), 2);
+        // a nested reset starts a NEW instance; counters() sees both
+        let mark = ce.mark();
+        ce.apply(&BoxStyle {
+            counter_reset: vec![("n".into(), 10)],
+            ..Default::default()
+        });
+        assert_eq!(ce.value("n"), 10);
+        assert_eq!(ce.values("n"), vec![2, 10]);
+        // increment/set hit the innermost instance
+        ce.apply(&BoxStyle {
+            counter_inc: vec![("n".into(), 5)],
+            counter_set: vec![("m".into(), 7)],
+            ..Default::default()
+        });
+        assert_eq!(ce.value("n"), 15);
+        assert_eq!(ce.value("m"), 7, "set on a missing counter creates it");
+        // leaving the child list drops its instances, keeping the outer one
+        ce.truncate(mark);
+        assert_eq!(ce.value("n"), 2);
+        assert_eq!(ce.value("m"), 0);
+        // an increment with nothing in scope behaves as reset-to-0 + delta
+        let mut ce2 = CounterEnv::default();
+        ce2.apply(&BoxStyle {
+            counter_inc: vec![("x".into(), 3)],
+            ..Default::default()
+        });
+        assert_eq!(ce2.value("x"), 3);
+    }
+
+    #[test]
+    fn content_counter_and_counters_render_values() {
+        let dom = dom_of("<p>x</p>");
+        let p = by_tag(&dom, "p");
+        let mut ce = CounterEnv::default();
+        ce.apply(&BoxStyle {
+            counter_reset: vec![("ref".into(), 0), ("link".into(), -1)],
+            ..Default::default()
+        });
+        ce.apply(&BoxStyle {
+            counter_inc: vec![("ref".into(), 1), ("link".into(), 1)],
+            ..Default::default()
+        });
+        assert_eq!(
+            content_text(
+                "counter(ref) '.' counter(link) ' '",
+                &dom,
+                p,
+                None,
+                &ce
+            ),
+            Some("1.0 ".to_string())
+        );
+        // styles: lower-alpha and upper-roman, and the quoted separator of
+        // counters() (nested instances outermost-first)
+        let mark = ce.mark();
+        ce.apply(&BoxStyle {
+            counter_reset: vec![("ref".into(), 0)],
+            ..Default::default()
+        });
+        ce.apply(&BoxStyle {
+            counter_inc: vec![("ref".into(), 3)],
+            ..Default::default()
+        });
+        assert_eq!(
+            content_text("counter(ref, upper-roman)", &dom, p, None, &ce),
+            Some("III".to_string())
+        );
+        assert_eq!(
+            content_text("counters(ref, '.', lower-alpha)", &dom, p, None, &ce),
+            Some("a.c".to_string())
+        );
+        ce.truncate(mark);
+        // unknown/custom style names fall back to decimal; `none` prints
+        assert_eq!(
+            content_text("counter(ref, meetei)", &dom, p, None, &ce),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            content_text("counter(ref, none)", &dom, p, None, &ce),
+            Some(String::new())
+        );
+    }
+
+    #[test]
+    fn counter_declarations_parse_onto_box_style() {
+        let dom = dom_of("<ol><li>x</li></ol>");
+        let ol = by_tag(&dom, "ol");
+        let sheet = parse(
+            "ol { counter-reset: a -1 b; counter-increment: a 2 b; counter-set: c 9 }",
+        );
+        let bx = sheet.resolve(&dom, ol, Style::new(), None).bx;
+        assert_eq!(
+            bx.counter_reset,
+            vec![("a".to_string(), -1), ("b".to_string(), 0)]
+        );
+        assert_eq!(
+            bx.counter_inc,
+            vec![("a".to_string(), 2), ("b".to_string(), 1)]
+        );
+        assert_eq!(bx.counter_set, vec![("c".to_string(), 9)]);
+        // counter names are case-sensitive custom idents (unlike keywords)
+        let sheet = parse("ol { counter-reset: MyCounter 2 }");
+        assert_eq!(
+            sheet.resolve(&dom, ol, Style::new(), None).bx.counter_reset,
+            vec![("MyCounter".to_string(), 2)]
+        );
+        // `none` clears an earlier declaration (the cascade still wins)
+        let sheet = parse("ol { counter-reset: a 5 } ol { counter-reset: none }");
+        assert!(sheet.resolve(&dom, ol, Style::new(), None).bx.counter_reset.is_empty());
+    }
+
+    #[test]
+    fn property_and_counter_style_at_rules_are_accepted() {
+        // Both define names, not rules: the blocks are skipped whole, and the
+        // at-rule census must not report them as unimplemented.
+        let sheet = parse(
+            "@property --x { syntax: '<length>'; inherits: false; initial-value: 0px }\
+             @counter-style thumbs { system: cyclic; symbols: 'x'; suffix: ' ' }\
+             @starting-style { p { color: #000000 } }\
+             @font-feature-values Font { something: 1 }\
+             p { color: #123456 }",
+        );
+        let dom = dom_of("<p>x</p>");
+        let st = sheet.resolve(&dom, by_tag(&dom, "p"), Style::new(), None);
+        assert_eq!(st.style.color, 0x12_34_56, "the rule after the blocks still parses");
     }
 
     #[test]
@@ -9637,7 +10074,7 @@ mod tests {
         let orq = "@supports (accent-color: red) or (color: light-dark(#fff, #fff)) { p { color: #222222 } }";
         assert_eq!(style_for_tag(&parse(orq), &dom, "p").color, 0x222222);
         // neither side supported => skip
-        let none = "@supports (accent-color: red) or (tab-size: 4) { p { color: #444444 } }";
+        let none = "@supports (accent-color: red) or (container-type: inline-size) { p { color: #444444 } }";
         assert_eq!(parse(none).rule_count(), 0);
     }
 
